@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="ja"><meta charset="utf-8"><title>Orbit Exporter</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{margin:0;display:flex;height:100vh;font:13px system-ui,sans-serif;background:#1b1b1f;color:#ddd}
+#p{width:250px;padding:12px;overflow:auto;background:#25252b}
+#m{flex:1;display:flex;align-items:center;justify-content:center;min-width:0}
+canvas{max-width:100%;max-height:100%;background:#000}
+label{display:flex;justify-content:space-between;align-items:center;margin:4px 0}
+input[type=number]{width:70px}button{width:100%;margin:6px 0;padding:8px}
+h4{margin:12px 0 4px;color:#9ab}
+</style>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+<div id="p">
+<h4>モデル</h4><input type="file" id="f" accept=".glb,.gltf">
+<h4>カメラ配置(Y-up・半球オービット)</h4>
+<label>段数<input type="number" id="rings" value="6"></label>
+<label>1周の枚数<input type="number" id="perRing" value="32"></label>
+<label>最低仰角°(負で下側)<input type="number" id="elevMin" value="10"></label>
+<label>最高仰角°<input type="number" id="elevMax" value="75"></label>
+<label>FOV(縦)°<input type="number" id="fov" value="40"></label>
+<label>距離マージン<input type="number" id="margin" step="0.05" value="1.15"></label>
+<h4>出力</h4>
+<label>幅<input type="number" id="w" value="1024"></label>
+<label>高さ<input type="number" id="h" value="1024"></label>
+<label>背景<input type="color" id="bg" value="#808080"></label>
+<label>初期点数(0=なし)<input type="number" id="npts" value="100000"></label>
+<h4>プレビュー</h4>
+<input type="range" id="sl" min="0" max="0" value="0" style="width:100%">
+<div id="info"></div>
+<label>fps<input type="number" id="fps" value="12"></label>
+<button id="play">▶ 再生(キーフレーム順)</button>
+<button id="exp">書き出し(フォルダ選択)</button>
+<div id="st"></div>
+</div>
+<div id="m"><canvas id="cv"></canvas></div>
+
+<script type="module">
+import * as THREE from 'three';
+import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
+import {RoomEnvironment} from 'three/addons/environments/RoomEnvironment.js';
+
+/* ========== CORE(プラットフォーム非依存。Three.jsに依存しない純粋関数) ========== */
+const D=Math.PI/180, pad=n=>String(n).padStart(2,'0');
+const sub=(a,b)=>a.map((v,i)=>v-b[i]);
+const norm=a=>{const l=Math.hypot(...a);return a.map(v=>v/l)};
+const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+
+// 視野に収まる距離(縦横の狭い方のFOVで判定)
+function fitRadius(boundR,fovY,aspect,margin){
+  const f=aspect>=1?fovY*D:2*Math.atan(Math.tan(fovY*D/2)*aspect);
+  return boundR/Math.sin(f/2)*margin;
+}
+// 段(仰角)×周(方位)でオービット上のカメラを生成。Y-up、target中心
+function buildCameras(o){
+  const out=[];
+  for(let r=0;r<o.rings;r++){
+    const el=o.rings===1?o.elevMin:o.elevMin+(o.elevMax-o.elevMin)*r/(o.rings-1);
+    for(let i=0;i<o.perRing;i++){
+      const az=360*i/o.perRing,e=el*D,a=az*D;
+      out.push({name:`r${pad(r)}_a${pad(i)}`,azimuth:az,elevation:el,radius:o.radius,
+        position:[o.target[0]+o.radius*Math.cos(e)*Math.sin(a),
+                  o.target[1]+o.radius*Math.sin(e),
+                  o.target[2]+o.radius*Math.cos(e)*Math.cos(a)]});
+    }
+  }
+  return out;
+}
+// camera-to-world(OpenGL規約: カメラは-Zを向き+Yが上)
+function c2w(c,t){
+  const f=norm(sub(t,c.position)),r=norm(cross(f,[0,1,0])),u=cross(r,f),p=c.position;
+  return [[r[0],u[0],-f[0],p[0]],[r[1],u[1],-f[1],p[1]],[r[2],u[2],-f[2],p[2]],[0,0,0,1]];
+}
+// COLMAP テキスト形式 (cameras / images / points3D)。ポーズは既知なのでSfM不要
+function mat2quat(R){
+  const t=R[0][0]+R[1][1]+R[2][2];let s;
+  if(t>0){s=Math.sqrt(t+1)*2;return[.25*s,(R[2][1]-R[1][2])/s,(R[0][2]-R[2][0])/s,(R[1][0]-R[0][1])/s]}
+  if(R[0][0]>R[1][1]&&R[0][0]>R[2][2]){s=Math.sqrt(1+R[0][0]-R[1][1]-R[2][2])*2;return[(R[2][1]-R[1][2])/s,.25*s,(R[0][1]+R[1][0])/s,(R[0][2]+R[2][0])/s]}
+  if(R[1][1]>R[2][2]){s=Math.sqrt(1+R[1][1]-R[0][0]-R[2][2])*2;return[(R[0][2]-R[2][0])/s,(R[0][1]+R[1][0])/s,.25*s,(R[1][2]+R[2][1])/s]}
+  s=Math.sqrt(1+R[2][2]-R[0][0]-R[1][1])*2;return[(R[1][0]-R[0][1])/s,(R[0][2]+R[2][0])/s,(R[1][2]+R[2][1])/s,.25*s];
+}
+function buildColmap(cams,o,pts){
+  const fl=o.h/2/Math.tan(o.fovY*D/2);
+  const cameras=`# CAMERA_ID MODEL WIDTH HEIGHT PARAMS[]\n1 PINHOLE ${o.w} ${o.h} ${fl} ${fl} ${o.w/2} ${o.h/2}\n`;
+  let images='# IMAGE_ID QW QX QY QZ TX TY TZ CAMERA_ID NAME\n';
+  cams.forEach((c,i)=>{
+    const M=c2w(c,o.target),Rw=[0,1,2].map(r=>[0,1,2].map(k=>(r===0?1:-1)*M[k][r])); // w2c = (c2w[OpenCV軸])の転置
+    const p=[M[0][3],M[1][3],M[2][3]],t=Rw.map(row=>-(row[0]*p[0]+row[1]*p[1]+row[2]*p[2])),q=mat2quat(Rw);
+    images+=`${i+1} ${q.join(' ')} ${t.join(' ')} 1 ${c.name}.png\n\n`;
+  });
+  let points3D='# POINT3D_ID X Y Z R G B ERROR TRACK[]\n';
+  pts.forEach((p,i)=>{points3D+=`${i+1} ${p[0]} ${p[1]} ${p[2]} ${p[3]} ${p[4]} ${p[5]} 0\n`});
+  return {'cameras.txt':cameras,'images.txt':images,'points3D.txt':points3D};
+}
+
+/* ========== ADAPTER(Three.js。差し替え対象) ========== */
+const $=id=>document.getElementById(id), v=id=>+$(id).value;
+const cv=$('cv'),renderer=new THREE.WebGLRenderer({canvas:cv,antialias:true,preserveDrawingBuffer:true});
+renderer.setPixelRatio(1);
+const scene=new THREE.Scene();
+scene.environment=new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(),0.04).texture;
+const dl=new THREE.DirectionalLight(0xffffff,1.5);dl.position.set(3,5,4);scene.add(dl); // ワールド固定の光(多視点で一貫させる)
+const cam=new THREE.PerspectiveCamera(40,1,0.01,1000);
+let model=null,cams=[],tgt=[0,0,0],bsr=1,timer=null;
+
+function opts(){
+  const aspect=v('w')/v('h');
+  return {rings:v('rings'),perRing:v('perRing'),elevMin:v('elevMin'),elevMax:v('elevMax'),
+    fovY:v('fov'),w:v('w'),h:v('h'),target:tgt,radius:fitRadius(bsr,v('fov'),aspect,v('margin'))};
+}
+function rebuild(){
+  const o=opts();cams=buildCameras(o);
+  $('sl').max=Math.max(0,cams.length-1);show(Math.min(+$('sl').value,cams.length-1));
+}
+function show(i){
+  const c=cams[i];if(!c)return;const o=opts();
+  scene.background=new THREE.Color($('bg').value);
+  cam.position.set(...c.position);cam.up.set(0,1,0);cam.lookAt(...tgt);
+  cam.fov=o.fovY;cam.aspect=o.w/o.h;cam.updateProjectionMatrix();
+  renderer.setSize(o.w,o.h,false);renderer.render(scene,cam);
+  $('sl').value=i;$('info').textContent=`${c.name}  (${i+1}/${cams.length})  az ${c.azimuth.toFixed(0)}° el ${c.elevation.toFixed(0)}°`;
+}
+$('f').onchange=async e=>{
+  const file=e.target.files[0];if(!file)return;
+  new GLTFLoader().parse(await file.arrayBuffer(),'',g=>{
+    if(model)scene.remove(model);model=g.scene;scene.add(model);
+    const b=new THREE.Box3().setFromObject(model),s=new THREE.Sphere();b.getBoundingSphere(s);
+    tgt=s.center.toArray();bsr=s.radius;rebuild();
+  },err=>$('st').textContent='読み込み失敗: '+err.message);
+};
+document.querySelectorAll('input[type=number],input[type=color]').forEach(el=>el.onchange=rebuild);
+$('sl').oninput=e=>show(+e.target.value);
+$('play').onclick=()=>{
+  if(timer){clearInterval(timer);timer=null;$('play').textContent='▶ 再生(キーフレーム順)';return}
+  $('play').textContent='■ 停止';
+  timer=setInterval(()=>show((+$('sl').value+1)%cams.length),1000/v('fps'));
+};
+// メッシュ表面を面積比でサンプリング(色: 頂点色 × テクスチャ × マテリアル色)
+async function samplePoints(n){
+  model.updateMatrixWorld(true);
+  const meshes=[];model.traverse(o=>{if(o.isMesh&&o.geometry.attributes.position)meshes.push(o)});
+  const tri=[],cum=[];let total=0;const A=new THREE.Vector3(),B=new THREE.Vector3(),C=new THREE.Vector3();
+  const vtx=(m,i,V)=>V.fromBufferAttribute(m.geometry.attributes.position,i).applyMatrix4(m.matrixWorld);
+  meshes.forEach((m,mi)=>{const ix=m.geometry.index,cnt=ix?ix.count:m.geometry.attributes.position.count;
+    for(let i=0;i+2<cnt;i+=3){
+      const a=ix?ix.getX(i):i,b=ix?ix.getX(i+1):i+1,c=ix?ix.getX(i+2):i+2;
+      vtx(m,a,A);vtx(m,b,B);vtx(m,c,C);B.sub(A);C.sub(A);total+=B.cross(C).length()/2;
+      tri.push(mi,a,b,c);cum.push(total);
+    }});
+  if(!total)return[];
+  const tex=new Map(),texel=t=>{if(!tex.has(t)){const im=t.image,cv=document.createElement('canvas');cv.width=im.width;cv.height=im.height;
+    const x=cv.getContext('2d',{willReadFrequently:true});x.drawImage(im,0,0);tex.set(t,x.getImageData(0,0,cv.width,cv.height))}return tex.get(t)};
+  const rgb={},tmp=new THREE.Color(),out=[],P=new THREE.Vector3();
+  for(let k=0;k<n;k++){
+    const r=Math.random()*total;let lo=0,hi=cum.length-1;while(lo<hi){const mid=(lo+hi)>>1;cum[mid]<r?lo=mid+1:hi=mid}
+    const m=meshes[tri[lo*4]],ia=tri[lo*4+1],ib=tri[lo*4+2],ic=tri[lo*4+3],g=m.geometry;
+    const s=Math.sqrt(Math.random()),u=1-s,v=s*(1-Math.random()),w=1-u-v;
+    vtx(m,ia,A);vtx(m,ib,B);vtx(m,ic,C);P.set(0,0,0).addScaledVector(A,u).addScaledVector(B,v).addScaledVector(C,w);
+    const mat=Array.isArray(m.material)?m.material[0]:m.material;let R=1,G=1,Bl=1;
+    if(mat&&mat.color){mat.color.getRGB(rgb,THREE.SRGBColorSpace);R=rgb.r;G=rgb.g;Bl=rgb.b}
+    const ca=g.attributes.color;
+    if(ca){const mix=f=>u*f(ia)+v*f(ib)+w*f(ic);tmp.setRGB(mix(i=>ca.getX(i)),mix(i=>ca.getY(i)),mix(i=>ca.getZ(i)),THREE.LinearSRGBColorSpace).getRGB(rgb,THREE.SRGBColorSpace);R*=rgb.r;G*=rgb.g;Bl*=rgb.b}
+    const ua=g.attributes.uv;
+    if(mat&&mat.map&&mat.map.image&&ua){
+      let tu=u*ua.getX(ia)+v*ua.getX(ib)+w*ua.getX(ic),tv=u*ua.getY(ia)+v*ua.getY(ib)+w*ua.getY(ic);
+      tu-=Math.floor(tu);tv-=Math.floor(tv);if(mat.map.flipY)tv=1-tv;
+      const d=texel(mat.map),px=Math.min(d.width-1,tu*d.width|0),py=Math.min(d.height-1,tv*d.height|0),o=(py*d.width+px)*4;
+      R*=d.data[o]/255;G*=d.data[o+1]/255;Bl*=d.data[o+2]/255;
+    }
+    const q=x=>Math.max(0,Math.min(255,Math.round(x*255)));
+    out.push([P.x.toFixed(6),P.y.toFixed(6),P.z.toFixed(6),q(R),q(G),q(Bl)]);
+  }
+  return out;
+}
+const dl_=(blob,name)=>{const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click()};
+$('exp').onclick=async()=>{
+  if(!model||!cams.length){$('st').textContent='先にGLBを読み込んでください';return}
+  if(timer)$('play').click();
+  let dir=null,imgs=null;
+  if(window.showDirectoryPicker){
+    try{dir=await showDirectoryPicker({mode:'readwrite'});imgs=await dir.getDirectoryHandle('images',{create:true})}
+    catch{return}
+  }
+  const put=async(h,name,blob)=>{const w=await(await h.getFileHandle(name,{create:true})).createWritable();await w.write(blob);await w.close()};
+  for(let i=0;i<cams.length;i++){
+    show(i);const blob=await new Promise(r=>cv.toBlob(r,'image/png'));
+    imgs?await put(imgs,cams[i].name+'.png',blob):dl_(blob,cams[i].name+'.png');
+    $('st').textContent=`書き出し中 ${i+1}/${cams.length}`;
+  }
+  $('st').textContent='COLMAP形式を書き出し中…';
+  const np=v('npts'),pts=np>0?await samplePoints(np):[];
+  const cm=buildColmap(cams,opts(),pts);
+  const sp=dir?await(await dir.getDirectoryHandle('sparse',{create:true})).getDirectoryHandle('0',{create:true}):null;
+  for(const [name,text] of Object.entries(cm)){const b=new Blob([text],{type:'text/plain'});sp?await put(sp,name,b):dl_(b,name)}
+  $('st').textContent=`完了(画像${cams.length}枚 + sparse/0 (COLMAP)、初期点${pts.length})`;
+};
+</script>
+</html>

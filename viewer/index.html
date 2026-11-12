@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="ja"><meta charset="utf-8"><title>Orbit Viewer</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#111;color:#ddd;font:13px system-ui,sans-serif}
+#stage{position:fixed;inset:0;touch-action:none;cursor:grab}
+canvas,#img{position:absolute;inset:0;width:100%;height:100%}
+#img{object-fit:cover;opacity:0;pointer-events:none;transform-origin:50% 50%}
+#osd{position:absolute;inset:0;opacity:0;pointer-events:none}
+#osd,#osd .openseadragon-container,#osd .openseadragon-canvas{background:transparent!important}
+#ui{display:none;position:fixed;top:8px;left:8px;background:#000a;padding:8px;border-radius:6px;z-index:2}
+#ui label{display:block;margin:4px 0}#hud{opacity:.8}#hud{position:fixed;left:8px;bottom:8px;margin:0;z-index:2;text-shadow:0 0 3px #000}#ui.min{background:none}#ui.min label{display:none}
+</style>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/","@sparkjsdev/spark":"https://cdn.jsdelivr.net/npm/@sparkjsdev/spark@2.4.0/dist/spark.module.js"}}</script>
+<script src="https://cdn.jsdelivr.net/npm/openseadragon@5.0.1/build/openseadragon/openseadragon.min.js"></script>
+<div id="stage"><canvas id="cv"></canvas><img id="img" alt=""><div id="osd"></div></div>
+<div id="ui">
+<label>書き出しフォルダ(images + transforms.json)<br><input type="file" id="dir" webkitdirectory></label>
+<label>3Dモデル<br><input type="file" id="glb" accept=".glb,.gltf,.ply,.spz,.splat,.ksplat,.sog"></label>
+</div>
+<div id="hud"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
+import {RoomEnvironment} from 'three/addons/environments/RoomEnvironment.js';
+import {SparkRenderer,SplatMesh} from '@sparkjsdev/spark';
+
+/* ===== 設定(ここを書き換えて調整) ===== */
+const CONFIG={
+  initial:{az:0,el:30},        // 初期位置(最寄りの撮影カメラにスナップして開始)
+  zoom:{initial:1,min:1,max:4},// ズーム倍率(=FOV変更のみ。位置は動かない)
+  snapMs:450,                  // 最寄りカメラへの移動時間
+  fadeMs:300,                  // 2D画像へのフェード時間
+  dragSpeed:0.35,              // ドラッグ感度(度/px)
+  elPad:3,                     // 撮影範囲の仰角からはみ出せる量(度)
+  bg:'#808080',                // 3D側の背景色(書き出し時の背景色と合わせる)
+  splatUpsideDown:false,       // 3DGSが上下逆に出たら true
+  splatQuat:[0,0,0,1]
+};
+
+/* ===== CORE(プラットフォーム非依存の純粋ロジック) ===== */
+const D=Math.PI/180;
+const dir=(az,el)=>[Math.cos(el*D)*Math.sin(az*D),Math.sin(el*D),Math.cos(el*D)*Math.cos(az*D)];
+const dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const nearest=(frames,az,el)=>{const d=dir(az,el);let b=null,m=-2;for(const f of frames){const s=dot(d,f.dir);if(s>m){m=s;b=f}}return b};
+const shortAng=(from,to)=>((to-from+540)%360)-180;
+const ease=t=>t<.5?2*t*t:1-Math.pow(-2*t+2,2)/2;
+// 2D画像(短辺合わせのcover)と3D視野を一致させる縦FOV。zoomはtanを割る=画角だけ変える
+function viewFovY(imgFovY,imgAspect,viewAspect,zoom){
+  const t=Math.tan(imgFovY*D/2);
+  const base=viewAspect>=imgAspect?t*imgAspect/viewAspect:t;
+  return 2*Math.atan(base/zoom)/D;
+}
+function parseFrames(tj){
+  return tj.frames.map(f=>({name:f.name,az:f.azimuth,el:f.elevation,file:f.file_path.split('/').pop(),dir:dir(f.azimuth,f.elevation)}));
+}
+
+// COLMAP(sparse/0 の cameras.txt / images.txt) から orbit 情報を復元(Y-up前提)
+// 注視点=各カメラの光軸への最小二乗交点、半径=注視点からの平均距離、方位/仰角=注視点から見たカメラ方向
+function colmapToManifest(camTxt,imgTxt){
+  const rows=t=>t.split('\n').map(l=>l.trim()).filter(l=>l&&!l.startsWith('#')).map(l=>l.split(/\s+/));
+  const c=rows(camTxt)[0],W=+c[2],H=+c[3],fy=+(['PINHOLE','OPENCV'].includes(c[1])?c[5]:c[4]);
+  const cams=rows(imgTxt).filter(p=>p.length>=10&&/\.\w+$/.test(p[9])).map(p=>{
+    const [w,x,y,z]=p.slice(1,5).map(Number),t=p.slice(5,8).map(Number);
+    const R=[[1-2*(y*y+z*z),2*(x*y-z*w),2*(x*z+y*w)],[2*(x*y+z*w),1-2*(x*x+z*z),2*(y*z-x*w)],[2*(x*z-y*w),2*(y*z+x*w),1-2*(x*x+y*y)]];
+    return {file:p[9],pos:[0,1,2].map(i=>-(R[0][i]*t[0]+R[1][i]*t[1]+R[2][i]*t[2])),d:R[2]};
+  });
+  const A=[[0,0,0],[0,0,0],[0,0,0]],b=[0,0,0];
+  for(const k of cams)for(let i=0;i<3;i++)for(let j=0;j<3;j++){const m=(i===j)-k.d[i]*k.d[j];A[i][j]+=m;b[i]+=m*k.pos[j]}
+  const det=M=>M[0][0]*(M[1][1]*M[2][2]-M[1][2]*M[2][1])-M[0][1]*(M[1][0]*M[2][2]-M[1][2]*M[2][0])+M[0][2]*(M[1][0]*M[2][1]-M[1][1]*M[2][0]);
+  const D0=det(A),target=[0,1,2].map(c=>det(A.map((row,r)=>row.map((v,k)=>k===c?b[r]:v)))/D0);
+  const frames=cams.map(k=>{const v=k.pos.map((p,i)=>p-target[i]),r=Math.hypot(...v);
+    return {name:k.file.split('/').pop().replace(/\.\w+$/,''),file_path:k.file,radius:r,azimuth:(Math.atan2(v[0],v[2])/D+360)%360,elevation:Math.asin(v[1]/r)/D}});
+  return {orbit:{target,radius:frames.reduce((s,f)=>s+f.radius,0)/frames.length,fov_y_deg:2*Math.atan(H/2/fy)/D,aspect:W/H},frames};
+}
+
+/* ===== BACKEND(差し替え対象。3DGS版も同じ I/F: load(file) / resize(w,h) / render(view)) ===== */
+class ThreeBackend{   // GLB と 3DGS(Spark)を同じI/Fで扱う
+  constructor(canvas){
+    this.r=new THREE.WebGLRenderer({canvas,antialias:true});this.r.setPixelRatio(Math.min(devicePixelRatio,2));
+    this.s=new THREE.Scene();this.s.background=new THREE.Color(CONFIG.bg);
+    this.s.environment=new THREE.PMREMGenerator(this.r).fromScene(new RoomEnvironment(),0.04).texture;
+    const l=new THREE.DirectionalLight(0xffffff,1.5);l.position.set(3,5,4);this.s.add(l);
+    this.cam=new THREE.PerspectiveCamera(40,1,0.01,1000);this.obj=null;this.spark=null;this.continuous=false;
+  }
+  async load(src,kind){  // src: File | URL文字列, kind: 'glb' | 'splat'
+    if(this.obj){this.s.remove(this.obj);this.obj.dispose?.();this.obj=null}
+    if(kind==='glb'){
+      const buf=typeof src==='string'?await (await fetch(src)).arrayBuffer():await src.arrayBuffer();
+      this.obj=await new Promise((ok,ng)=>new GLTFLoader().parse(buf,'',g=>ok(g.scene),ng));this.continuous=false;
+    }else{
+      if(!this.spark){this.spark=new SparkRenderer({renderer:this.r});this.s.add(this.spark)}
+      const m=new SplatMesh(typeof src==='string'?{url:src}:{fileBytes:await src.arrayBuffer(),fileName:src.name});
+      m.quaternion.set(...CONFIG.splatQuat);await m.initialized;this.obj=m;this.continuous=true;  // スプラットのソートに毎フレーム描画が必要
+    }
+    this.s.add(this.obj);
+  }
+  resize(w,h){this.r.setSize(w,h,false)}
+  render({position,target,fovY,aspect}){
+    const c=this.cam;c.position.set(...position);c.up.set(0,1,0);c.lookAt(...target);
+    c.fov=fovY;c.aspect=aspect;c.updateProjectionMatrix();this.r.render(this.s,c);
+  }
+}
+
+/* ===== VIEWER ===== */
+const $=id=>document.getElementById(id),stage=$('stage'),img=$('img'),hud=$('hud');
+const be=new ThreeBackend($('cv'));
+let tj=null,frames=[],urls={},hasModel=false,orbit=null,dziFiles={},dziInfo={},osd=null;
+const osdEl=$('osd');
+const S={az:CONFIG.initial.az,el:CONFIG.initial.el,zoom:CONFIG.zoom.initial,mode:'3d',token:0,cur:null};
+let elMin=0,elMax=90;
+
+const aspect=()=>innerWidth/innerHeight;
+function draw(){
+  if(!orbit||!hasModel)return;
+  const d=dir(S.az,S.el),r=orbit.radius,t=orbit.target;
+  be.render({position:[t[0]+d[0]*r,t[1]+d[1]*r,t[2]+d[2]*r],target:t,
+    fovY:viewFovY(orbit.fov_y_deg,orbit.aspect,aspect(),S.zoom),aspect:aspect()});
+  img.style.transform=`scale(${S.zoom})`;
+}
+function resize(){be.resize(innerWidth,innerHeight);draw();applyOsdView()}
+addEventListener('resize',resize);
+
+function setMode(){say(`${S.mode.toUpperCase()}  ${S.cur?S.cur.name:''}  zoom ${S.zoom.toFixed(2)}  [H:メニュー]`);if(S.mode==='2d')applyOsdView()}
+
+/* ===== 2D層: DZIがあればOpenSeadragon(ディープズーム)、なければ単一PNG =====
+   OSDは入力を受けず、ズームとパンを3DのFOVと同じ「短辺合わせcover+中心固定」に合わせて外から制御する */
+function ensureOsd(){
+  if(!osd&&window.OpenSeadragon)osd=OpenSeadragon({element:osdEl,showNavigationControl:false,mouseNavEnabled:false,
+    animationTime:0,immediateRender:true,blendTime:0.15,maxZoomPixelRatio:8,minZoomImageRatio:0.1,visibilityRatio:0,constrainDuringPan:false});
+  return osd;
+}
+function applyOsdView(){
+  if(!osd||!osd.world.getItemCount())return;
+  const sz=osd.world.getItemAt(0).getContentSize(),ai=sz.x/sz.y,av=innerWidth/innerHeight;
+  osd.viewport.zoomTo((av>=ai?1:ai/av)*S.zoom,null,true);
+  osd.viewport.panTo(new OpenSeadragon.Point(.5,sz.y/sz.x/2),true);
+}
+async function getDziSource(f){
+  if(!(f.name in dziInfo)){
+    const df=dziFiles[`dzi/${f.name}.dzi`];dziInfo[f.name]=null;let txt=null;
+    if(df)txt=await df.text();else{try{const r=await fetch(`dzi/${f.name}.dzi`);if(r.ok)txt=await r.text()}catch{}}
+    if(txt){const x=new DOMParser().parseFromString(txt,'text/xml'),im=x.documentElement,sz=x.getElementsByTagName('Size')[0];
+      dziInfo[f.name]={W:+sz.getAttribute('Width'),H:+sz.getAttribute('Height'),fmt:im.getAttribute('Format'),T:+im.getAttribute('TileSize'),O:+im.getAttribute('Overlap')}}
+  }
+  const i=dziInfo[f.name];if(!i||!window.OpenSeadragon)return null;
+  const cache={};
+  return new OpenSeadragon.TileSource({width:i.W,height:i.H,tileSize:i.T,tileOverlap:i.O,minLevel:0,maxLevel:Math.ceil(Math.log2(Math.max(i.W,i.H))),
+    getTileUrl:(l,x,y)=>{const p=`dzi/${f.name}_files/${l}/${x}_${y}.${i.fmt}`,tf=dziFiles[p];return tf?(cache[p]||(cache[p]=URL.createObjectURL(tf))):p}});
+}
+function openDzi(src){return new Promise(ok=>{
+  const t0=performance.now(),go=()=>requestAnimationFrame(()=>requestAnimationFrame(ok));
+  osd.addOnceHandler('open',()=>{
+    applyOsdView();
+    // 最初のタイルが描画可能になったらフェード開始。OSD 5 の既定(WebGLドローラー)は tile-drawn を出さないので、タイルの有無を毎フレーム確認する
+    (function wait(){
+      const it=osd.world.getItemAt(0);
+      if((it&&it.getTilesToDraw().length>0)||performance.now()-t0>1500)go();else requestAnimationFrame(wait);
+    })();
+  });
+  osd.addOnceHandler('open-failed',ok);setTimeout(ok,4000);   // 失敗してもスナップ処理が止まらないように
+  osd.open(src);
+})}
+function to3D(){S.token++;S.mode='3d';for(const el of [img,osdEl]){el.style.transition='none';el.style.opacity=0}setMode()}
+
+async function snap(){
+  const tk=++S.token,f=nearest(frames,S.az,S.el);S.cur=f;
+  const a0=S.az,e0=S.el,da=shortAng(a0,f.az),de=f.el-e0,t0=performance.now();
+  await new Promise(ok=>{(function step(now){
+    if(tk!==S.token)return ok();
+    const k=Math.min(1,(now-t0)/CONFIG.snapMs),e=ease(k);
+    S.az=(a0+da*e+360)%360;S.el=e0+de*e;draw();
+    k<1?requestAnimationFrame(step):ok();
+  })(t0)});
+  if(tk!==S.token)return;
+  const src=await getDziSource(f);let el=img;
+  if(src&&ensureOsd()){el=osdEl;await openDzi(src)}
+  else if(urls[f.file]){img.src=urls[f.file];try{await img.decode()}catch{}}   // デバッグ(フォルダ選択)時のみ元画像を使う
+  else{say(`2D画像がありません: dzi/${f.name}.dzi が見つかりません(タイル化とフォルダ構成を確認)`,true);return}
+  if(tk!==S.token)return;
+  el.style.transition=`opacity ${CONFIG.fadeMs}ms`;el.style.opacity=1;S.mode='2d';S.live=performance.now()+CONFIG.fadeMs+200;setMode();
+}
+
+/* 入力: ドラッグ=オービット / ホイール・ピンチ=ズーム(FOVのみ) / 離すと最寄りカメラへスナップ */
+const ptrs=new Map();let dragging=false,pinch0=0,zoom0=1,start=null;
+const clampZoom=z=>Math.min(CONFIG.zoom.max,Math.max(CONFIG.zoom.min,z));
+stage.onpointerdown=e=>{
+  if(!orbit)return;stage.setPointerCapture(e.pointerId);ptrs.set(e.pointerId,{x:e.clientX,y:e.clientY});
+  start={x:e.clientX,y:e.clientY};dragging=false;
+  if(ptrs.size===2){const [a,b]=[...ptrs.values()];pinch0=Math.hypot(a.x-b.x,a.y-b.y);zoom0=S.zoom}
+};
+stage.onpointermove=e=>{
+  const p=ptrs.get(e.pointerId);if(!p)return;
+  if(ptrs.size===2){
+    p.x=e.clientX;p.y=e.clientY;const [a,b]=[...ptrs.values()];
+    S.zoom=clampZoom(zoom0*Math.hypot(a.x-b.x,a.y-b.y)/pinch0);draw();setMode();return;
+  }
+  if(!dragging&&Math.hypot(e.clientX-start.x,e.clientY-start.y)>3){dragging=true;to3D()}
+  if(dragging){
+    S.az=(S.az-(e.clientX-p.x)*CONFIG.dragSpeed+360)%360;
+    S.el=Math.min(elMax,Math.max(elMin,S.el+(e.clientY-p.y)*CONFIG.dragSpeed));draw();
+  }
+  p.x=e.clientX;p.y=e.clientY;
+};
+stage.onpointerup=stage.onpointercancel=e=>{
+  ptrs.delete(e.pointerId);
+  if(ptrs.size===0&&dragging){dragging=false;snap()}
+};
+stage.onwheel=e=>{e.preventDefault();S.zoom=clampZoom(S.zoom*Math.exp(-e.deltaY*0.001));draw();setMode()};
+
+addEventListener('keydown',e=>{if(e.key==='h'||e.key==='H')$('ui').classList.toggle('min')});
+
+/* ===== ロード ===== */
+async function tryStart(){
+  if(!tj||!hasModel)return;
+  orbit=tj.orbit;frames=parseFrames(tj);
+  elMin=Math.min(...frames.map(f=>f.el))-CONFIG.elPad;elMax=Math.min(89,Math.max(...frames.map(f=>f.el))+CONFIG.elPad);
+  resize();await snap();$('ui').classList.add('min');
+}
+$('dir').onchange=async e=>{
+  urls={};dziFiles={};dziInfo={};tj=null;let camTxt=null,imgTxt=null;
+  for(const f of e.target.files){
+    const p=(f.webkitRelativePath||f.name).split('/').slice(1).join('/')||f.name;  // 選択フォルダ直下からの相対パス
+    if(p.startsWith('dzi/')){dziFiles[p]=f;continue}
+    if(p==='transforms.json')tj=JSON.parse(await f.text());
+    else if(p==='sparse/0/cameras.txt')camTxt=await f.text();
+    else if(p==='sparse/0/images.txt')imgTxt=await f.text();
+    else if(/\.(png|jpe?g|webp)$/i.test(f.name))urls[f.name]=URL.createObjectURL(f);
+  }
+  if(!tj&&camTxt&&imgTxt)tj=colmapToManifest(camTxt,imgTxt);   // transforms.jsonが無くてもCOLMAPから復元
+  const nd=Object.keys(dziFiles).filter(k=>k.endsWith('.dzi')).length;
+  hud.textContent=tj?`${tj.frames.length}カメラ読み込み済み`+(nd?` / DZI ${nd}枚`:''):'transforms.json か sparse/0 が見つかりません';tryStart();
+};
+$('glb').onchange=async e=>{
+  const f=e.target.files[0];if(!f)return;
+  const kind=/\.(glb|gltf)$/i.test(f.name)?'glb':'splat';  // 拡張子で自動判定
+  hud.textContent=`${kind==='glb'?'GLB':'3DGS'}読み込み中…`;
+  try{await be.load(f,kind)}catch(err){hud.textContent='読み込み失敗: '+err.message;return}
+  hasModel=true;hud.textContent=`${kind==='glb'?'GLB':'3DGS'}読み込み済み`;tryStart();
+};
+(function loop(){if(be.continuous&&orbit&&hasModel&&(S.mode==='3d'||performance.now()<S.live))draw();requestAnimationFrame(loop)})();
+
+/* ===== サイトモード(既定): 固定ファイル名のルールで自動ロード =====
+   index.html と同じフォルダに置くもの:
+     model.sog (.spz/.ply/.glb でも可) / sparse/0/cameras.txt, images.txt / dzi/<カメラ名>.dzi + <カメラ名>_files/ / config.json(任意)
+   ?debug を付けて開くと、従来のファイル選択UI(ローカル確認用)が出る */
+const DEBUG=new URLSearchParams(location.search).has('debug');
+function say(m,err){if(DEBUG||err)hud.textContent=m}
+function applyConfig(c){for(const k in c){if(c[k]&&typeof c[k]==='object'&&!Array.isArray(c[k])&&CONFIG[k])Object.assign(CONFIG[k],c[k]);else CONFIG[k]=c[k]}}
+const head=async u=>{try{return (await fetch(u,{method:'HEAD'})).ok}catch{return false}};
+async function autoLoad(){
+  try{
+    const cr=await fetch('config.json');
+    if(cr.ok){let c;try{c=await cr.json()}catch(e){throw Error('config.json の書式が正しくありません ('+e.message+')')}applyConfig(c);if(CONFIG.splatUpsideDown)CONFIG.splatQuat=[1,0,0,0]}
+    S.az=CONFIG.initial.az;S.el=CONFIG.initial.el;S.zoom=CONFIG.zoom.initial;be.s.background=new THREE.Color(CONFIG.bg);
+    const [c,i]=await Promise.all(['sparse/0/cameras.txt','sparse/0/images.txt'].map(u=>fetch(u).then(r=>{if(!r.ok)throw Error(u+' が見つかりません');return r.text()})));
+    tj=colmapToManifest(c,i);
+    let model=null;for(const n of ['model.sog','model.spz','model.ply','model.glb'])if(await head(n)){model=n;break}
+    if(!model)throw Error('model.sog(または .spz/.ply/.glb)が見つかりません');
+    await be.load(model,/\.glb$/.test(model)?'glb':'splat');hasModel=true;await tryStart();
+  }catch(e){say('読み込み失敗: '+e.message+(location.protocol==='file:'?'  (file://では動きません。http経由で開いてください)':''),true)}
+}
+if(DEBUG)$('ui').style.display='block';else{$('ui').style.display='none';autoLoad()}
+</script>
+</html>

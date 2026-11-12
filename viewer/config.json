@@ -1,0 +1,8 @@
+{
+  "initial": { "az": 0, "el": 30 },
+  "zoom": { "initial": 1, "min": 1, "max": 8 },
+  "splatUpsideDown": false,
+  "snapMs": 450,
+  "fadeMs": 300,
+  "dragSpeed": 0.35
+}

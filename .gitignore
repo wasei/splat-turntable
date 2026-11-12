@@ -1,0 +1,13 @@
+# 作業フォルダ(レンダリング素材と成果物)はリポジトリに入れない
+work/
+.build/
+site/
+*_splat/
+node_modules/
+__pycache__/
+# リポジトリ直下に素材を置いて実行した場合
+/images/
+/sparse/
+
+# Local Netlify folder
+.netlify
