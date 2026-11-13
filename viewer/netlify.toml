@@ -1,0 +1,7 @@
+# splat-turntable の生成サイト用設定
+# 生成物はビルド不要の純粋な静的サイトです。このファイルがあることで、
+# Netlify がフレームワーク（Hugo 等）と誤判定してビルドを実行するのを防ぎます。
+# ファイル側の設定は、Netlify 管理画面（UI）側のビルド設定より優先されます。
+[build]
+  publish = "."
+  command = "echo 'splat-turntable: static site - no build step'"

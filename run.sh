@@ -165,6 +165,7 @@ else
   else echo "WARN: 圧縮に失敗したため model.ply で出力します(中間PLYは残します)"; rm -f "$OUT/model.sog"; cp "$SPLAT" "$OUT/model.ply"; fi
 fi
 cp "$ROOT/viewer/index.html" "$OUT/index.html"
+cp "$ROOT/viewer/netlify.toml" "$OUT/netlify.toml"   # Netlify用「ビルドなし・フォルダそのまま公開」の宣言(フレームワーク誤判定でビルドが走るのを防ぐ)
 # config.json はビューアーの設定(初期の視点・ズーム・上下反転など)。ユーザーが編集するので、無いときだけ雛形を作る
 [ -f "$OUT/config.json" ] || cp "$ROOT/viewer/config.json" "$OUT/config.json"
 PORT="${PORT:-8000}"
@@ -181,5 +182,5 @@ echo "  2. ブラウザで  http://localhost:$PORT/  を開きます"
 echo "  (次回から、実行のときに --serve を付けると、完了後に自動で起動します)"
 echo
 echo "【ビューアーの設定】 $OUT/config.json を編集します(初期の視点・ズーム・3Dの上下反転など)。再実行しても上書きされません"
-echo "【公開する】 出力フォルダの中身を、そのままWebサーバーに置きます"
+echo "【公開する】 出力フォルダの中身を、そのままWebサーバーに置きます(Netlify用に netlify.toml を同梱済み: ビルドなしでそのまま配信されます)"
 if [ "$SERVE" = 1 ]; then echo; echo "== サーバー起動中: http://localhost:$PORT/  (Ctrl+C で停止) =="; exec python3 -m http.server "$PORT" --directory "$OUT"; fi
