@@ -13,6 +13,7 @@ canvas,#img{position:absolute;inset:0;width:100%;height:100%}
 </style>
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/","@sparkjsdev/spark":"https://cdn.jsdelivr.net/npm/@sparkjsdev/spark@2.4.0/dist/spark.module.js"}}</script>
 <script src="https://cdn.jsdelivr.net/npm/openseadragon@5.0.1/build/openseadragon/openseadragon.min.js"></script>
+<body>
 <div id="stage"><canvas id="cv"></canvas><img id="img" alt=""><div id="osd"></div></div>
 <div id="ui">
 <label>書き出しフォルダ(images + transforms.json)<br><input type="file" id="dir" webkitdirectory></label>
@@ -263,4 +264,5 @@ async function autoLoad(){
 }
 if(DEBUG)$('ui').style.display='block';else{$('ui').style.display='none';autoLoad()}
 </script>
+</body>
 </html>
